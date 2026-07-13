@@ -8,7 +8,7 @@ Python SDK and reference Arbiter for the LLM Shared-Bus Turn Allocation Protocol
 
 ```bash
 pip install -e ".[dev]"
-pytest                    # 41 tests, all async
+pytest                    # 45 tests, all async
 ```
 
 No runtime deps — stdlib only. Tests use `pytest-asyncio` with `asyncio_mode = "auto"`.
@@ -37,9 +37,9 @@ tests/
 
 **Bundled bids (§4.6).** When a transmission occurs in Phase 6, the Arbiter embeds a `BidRequest` inside each `BusEvent` for participants that will be eligible next tick. The `deliver_event` task from Phase 6 doubles as the bid collector for Phase 2 of tick N+1. This halves the round-trips for active participants. `InProcessConnector.deliver_event` implements this — it must return a `Bid` when `event.bid_request` is non-null.
 
-**Cooldown is post-win suppression.** `COOLDOWN_TICKS=0` means the winner is immediately eligible again (and receives a bundled BidRequest). `COOLDOWN_TICKS>=1` sets `ineligible_ticks = COOLDOWN_TICKS + 1`; the +1 compensates for Phase 1's pre-decrement on the next tick.
+**Cooldown is post-win dampening, not a lockout.** The winner always stays eligible (and receives a bundled BidRequest). For the `COOLDOWN_TICKS` ticks after a win — derived at weighting time as `channel.tick - last_acted_tick <= COOLDOWN_TICKS`, no stored counter — the winner's bids are multiplied ×0.3 in Phase 3. `COOLDOWN_TICKS=0` disables dampening. `ineligible_ticks` is set only by the failure-streak path (§4.5).
 
-**Direct-address bias.** If participant P was addressed by the previous transmission, its weighted priority is floored at 0.95 in Phase 3.
+**Direct-address bias.** If participant P was addressed by the previous transmission, its bid priority is multiplied ×2.0 in Phase 3. Multiplicative, so P's own priority signal is preserved — the earlier `max(p, 0.95)` floor caused persistent address loops in deployment (spec §4.3 design note).
 
 **Safe default bid.** Any bid collection error (timeout, exception, None return, invalid field) results in `Bid(want_to_send=False, priority=0.0, intent="pass")`. Participants are never penalised for a bad bid — only for a bad transmission (failure streak).
 

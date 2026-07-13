@@ -13,6 +13,8 @@ IS its bid for tick N+1.  The Arbiter stores the asyncio Task that wraps each
 deliver_event call and awaits it (with BID_TIMEOUT) at Phase 2 of tick N+1.
 Only participants who did NOT receive a bundled BidRequest — new joiners and
 participants who were ineligible during tick N — get a standalone BidRequest.
+The winner of tick N stays eligible (cooldown dampens its bids, §4.3; it does
+not lock it out), so the winner receives a bundled BidRequest like everyone else.
 """
 
 from __future__ import annotations
@@ -99,7 +101,7 @@ class Arbiter:
     def __init__(
         self,
         *,
-        cooldown_ticks: int = 1,
+        cooldown_ticks: int = 2,
         bid_timeout: float = 5.0,
         transmission_timeout: float = 60.0,
         max_consecutive_failures: int = 2,
@@ -355,14 +357,17 @@ class Arbiter:
 
         # ----------------------------------------------------------------
         # Phase 3 — Weight bids (§4.3)
-        # Cooldown dampening removed; only direct-address bias + clamp remain.
+        # Pipeline: cooldown dampening (×0.3, derived from last_acted_tick),
+        # direct-address bias (×2.0), clamp.
         # ----------------------------------------------------------------
         most_recent_tx = self._most_recent_transmission(channel)
         weighted_bids: List[_WeightedBid] = []
 
         for pid in eligible_ids:
             raw = raw_bids.get(pid, _SAFE_DEFAULT_BID)
-            wp = self._weight_bid(raw, pid, most_recent_tx)
+            wp = self._weight_bid(
+                raw, channel.participants[pid], channel, most_recent_tx
+            )
             weighted_bids.append(
                 _WeightedBid(
                     participant_id=pid,
@@ -442,23 +447,20 @@ class Arbiter:
             channel.log.append(log_entry)
 
             # Apply post-transmission winner state BEFORE computing eligibility.
-            # COOLDOWN_TICKS controls post-win suppression:
-            #   0  → winner eligible immediately (gets a bundled BidRequest)
-            #   1+ → winner sits out that many ticks (bid_request=null)
-            # The +1 offset compensates for Phase 1's pre-decrement next tick.
+            # Setting last_acted_tick opens the winner's cooldown window: its
+            # bids are dampened ×0.3 by Phase 3 for the next COOLDOWN_TICKS
+            # ticks (§4.3).  The winner stays eligible — ineligible_ticks is
+            # only ever set by the failure-streak path (§4.5).
             w = channel.participants[winner_id]
             w.last_acted_tick = channel.tick
-            if self.COOLDOWN_TICKS > 0:
-                w.ineligible_ticks = self.COOLDOWN_TICKS + 1
             w.failure_streak = 0
 
             # Pre-compute next-tick eligibility for each current participant.
             # A participant is eligible next tick when
             # max(0, ineligible_ticks - 1) == 0  after Phase 1 decrements.
-            # With COOLDOWN_TICKS=0 the winner's post_decrement is 0 so it is
-            # eligible and receives a bundled BidRequest; with COOLDOWN_TICKS>=1
-            # post_decrement>=1 so it is excluded automatically — no special
-            # pid==winner_id guard is needed.
+            # The winner is eligible like everyone else and receives a
+            # bundled BidRequest; only failure-penalised participants are
+            # excluded.
             next_bundled: Dict[ParticipantId, asyncio.Task] = {}
             snapshot_connectors = dict(self._connectors[channel.id])
 
@@ -577,25 +579,37 @@ class Arbiter:
 
     # ------------------------------------------------------------------
     # Phase 3: deterministic bid weighting (§4.3)
-    # Cooldown dampening removed; only direct-address bias + clamp.
+    # Pipeline: cooldown dampening → direct-address bias → clamp.
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _weight_bid(
+        self,
         bid: Bid,
-        participant_id: ParticipantId,
+        participant: Participant,
+        channel: Channel,
         most_recent_tx: Optional[ParticipantTransmission],
     ) -> float:
         p = bid.priority
 
-        # Step 1: direct-address bias
+        # Step 1: cooldown dampening.  The window is derived from
+        # last_acted_tick — there is no stored counter (§4.3).  Multiplicative,
+        # not a lockout: a recent winner can still win if nobody else contends.
+        if (
+            participant.last_acted_tick is not None
+            and channel.tick - participant.last_acted_tick <= self.COOLDOWN_TICKS
+        ):
+            p *= 0.3
+
+        # Step 2: direct-address bias.  Multiplicative so the addressee's own
+        # priority signal is preserved; the earlier max(p, 0.95) floor caused
+        # persistent address loops in deployment (spec §4.3 design note).
         if (
             most_recent_tx is not None
-            and most_recent_tx.addressed_to == participant_id
+            and most_recent_tx.addressed_to == participant.id
         ):
-            p = max(p, 0.95)
+            p *= 2.0
 
-        # Step 2: clamp
+        # Step 3: clamp
         return max(0.0, min(1.0, p))
 
     # ------------------------------------------------------------------
