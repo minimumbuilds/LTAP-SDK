@@ -19,7 +19,7 @@ from ltap import (
     TransmissionResponse,
 )
 from ltap.arbiter import Arbiter, _SAFE_DEFAULT_BID
-from ltap.models import Participant, ParticipantTransmission
+from ltap.models import Channel, Participant, ParticipantTransmission
 
 
 # ---------------------------------------------------------------------------
@@ -190,57 +190,92 @@ class TestRegistration(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests: Bid weighting (cooldown dampening removed)
+# Tests: Bid weighting (§4.3 — cooldown dampening ×0.3, direct-address ×2.0)
 # ---------------------------------------------------------------------------
 
 
 class TestBidWeighting(unittest.IsolatedAsyncioTestCase):
 
+    def _weigh(
+        self,
+        priority: float,
+        *,
+        last_acted_tick: int | None = None,
+        tick: int = 1,
+        cooldown_ticks: int = 2,
+        addressed_to: str | None = None,
+    ) -> float:
+        arbiter = Arbiter(cooldown_ticks=cooldown_ticks)
+        participant = Participant(id="x", last_acted_tick=last_acted_tick)
+        channel = Channel(id="c")
+        channel.tick = tick
+        most_recent = (
+            ParticipantTransmission(
+                tick=max(0, tick - 1), sender="y", content="hi",
+                addressed_to=addressed_to,
+            )
+            if addressed_to is not None
+            else None
+        )
+        bid = Bid(want_to_send=True, priority=priority)
+        return arbiter._weight_bid(bid, participant, channel, most_recent)
+
     def test_no_address_no_bias(self):
-        bid = Bid(want_to_send=True, priority=0.7)
-        w = Arbiter._weight_bid(bid, "x", None)
-        self.assertAlmostEqual(w, 0.7, places=5)
+        self.assertAlmostEqual(self._weigh(0.7), 0.7, places=5)
 
-    def test_direct_address_bias_applied(self):
-        most_recent = ParticipantTransmission(
-            tick=1, sender="y", content="hi", addressed_to="x"
+    def test_direct_address_bias_is_multiplicative(self):
+        # 0.1 × 2.0 = 0.2 — a nudge, not a jump to a floor.
+        self.assertAlmostEqual(
+            self._weigh(0.1, addressed_to="x"), 0.2, places=5
         )
-        bid = Bid(want_to_send=True, priority=0.1)
-        w = Arbiter._weight_bid(bid, "x", most_recent)
-        self.assertAlmostEqual(w, 0.95, places=5)
 
-    def test_direct_address_raises_low_priority(self):
-        most_recent = ParticipantTransmission(
-            tick=1, sender="y", content="hi", addressed_to="x"
+    def test_direct_address_preserves_zero_priority(self):
+        # An addressee that bids 0.0 is not dragged into the conversation
+        # (the old max(p, 0.95) floor would have forced 0.95 here).
+        self.assertAlmostEqual(
+            self._weigh(0.0, addressed_to="x"), 0.0, places=5
         )
-        bid = Bid(want_to_send=True, priority=0.0)
-        w = Arbiter._weight_bid(bid, "x", most_recent)
-        self.assertAlmostEqual(w, 0.95, places=5)
 
     def test_address_to_different_participant_no_effect(self):
-        most_recent = ParticipantTransmission(
-            tick=1, sender="y", content="hi", addressed_to="z"
+        self.assertAlmostEqual(
+            self._weigh(0.5, addressed_to="z"), 0.5, places=5
         )
-        bid = Bid(want_to_send=True, priority=0.5)
-        w = Arbiter._weight_bid(bid, "x", most_recent)
-        self.assertAlmostEqual(w, 0.5, places=5)
 
     def test_clamp_at_1(self):
-        most_recent = ParticipantTransmission(
-            tick=1, sender="y", content="hi", addressed_to="x"
-        )
-        bid = Bid(want_to_send=True, priority=1.0)
-        w = Arbiter._weight_bid(bid, "x", most_recent)
-        self.assertLessEqual(w, 1.0)
+        self.assertLessEqual(self._weigh(1.0, addressed_to="x"), 1.0)
 
-    def test_no_cooldown_dampening(self):
-        """Cooldown dampening (×0.3) was removed from the spec; verify absence."""
-        # Even with ineligible_ticks > 0 on the participant (shouldn't reach weighting),
-        # the weight formula has no dampening factor.
-        bid = Bid(want_to_send=True, priority=1.0)
-        w = Arbiter._weight_bid(bid, "x", None)
-        self.assertAlmostEqual(w, 1.0, places=5,
-                               msg="No ×0.3 dampening should exist in updated spec")
+    def test_cooldown_dampening_in_window(self):
+        # Won tick 5; weighting at tick 6 with COOLDOWN_TICKS=2 → ×0.3.
+        self.assertAlmostEqual(
+            self._weigh(1.0, last_acted_tick=5, tick=6), 0.3, places=5
+        )
+
+    def test_cooldown_window_expires(self):
+        # Won tick 5; tick 8 is outside a 2-tick window → no dampening.
+        self.assertAlmostEqual(
+            self._weigh(1.0, last_acted_tick=5, tick=8), 1.0, places=5
+        )
+
+    def test_never_acted_no_dampening(self):
+        self.assertAlmostEqual(
+            self._weigh(1.0, last_acted_tick=None, tick=1), 1.0, places=5
+        )
+
+    def test_cooldown_zero_disables_dampening(self):
+        self.assertAlmostEqual(
+            self._weigh(1.0, last_acted_tick=5, tick=6, cooldown_ticks=0),
+            1.0,
+            places=5,
+        )
+
+    def test_dampening_composes_with_address_bias(self):
+        # In-window addressee: 0.5 × 0.3 × 2.0 = 0.3 — the bias does not
+        # override cooldown (that override is what caused address loops).
+        self.assertAlmostEqual(
+            self._weigh(0.5, last_acted_tick=5, tick=6, addressed_to="x"),
+            0.3,
+            places=5,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -376,8 +411,9 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
         await p.deregister(arbiter, "silent")
         await arbiter.destroy_channel("silent")
 
-    async def test_winner_becomes_ineligible_after_win(self):
-        """Phase 6 sets ineligible_ticks = COOLDOWN_TICKS+1; winner sits out that many ticks."""
+    async def test_winner_dampened_but_eligible_after_win(self):
+        """Phase 6 sets last_acted_tick; the winner stays eligible and its
+        next COOLDOWN_TICKS bids are dampened ×0.3 by Phase 3 (§4.3)."""
         emitter = CollectingEmitter()
         arbiter = Arbiter(
             cooldown_ticks=2,
@@ -386,31 +422,31 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
             observability_emitter=emitter,
             tick_interval=0.01,
         )
-        arbiter.create_channel("inelig")
+        arbiter.create_channel("dampen")
         p = _AlwaysBid("w", priority=1.0)
-        await p.register(arbiter, "inelig")
+        await p.register(arbiter, "dampen")
 
         await asyncio.sleep(0.15)
 
-        # After any win, the next records for that participant should have
-        # ineligible=True for COOLDOWN_TICKS consecutive ticks.
         recs = [r for r in emitter.records if r.participant == "w"]
         for i, rec in enumerate(recs):
             if rec.won:
-                # The next COOLDOWN_TICKS records should be ineligible
-                inelig_following = [
-                    recs[j].ineligible
-                    for j in range(i + 1, min(i + 1 + 2, len(recs)))
-                ]
-                if inelig_following:
-                    self.assertTrue(
-                        inelig_following[0],
-                        "winner should be ineligible the tick immediately after winning",
+                following = recs[i + 1 : i + 1 + 2]
+                for f in following:
+                    self.assertFalse(
+                        f.ineligible,
+                        "winner must stay eligible after a win (no lockout)",
+                    )
+                    self.assertAlmostEqual(
+                        f.weighted_priority,
+                        f.raw_priority * 0.3,
+                        places=5,
+                        msg="winner's bids inside the cooldown window are ×0.3",
                     )
                 break
 
-        await p.deregister(arbiter, "inelig")
-        await arbiter.destroy_channel("inelig")
+        await p.deregister(arbiter, "dampen")
+        await arbiter.destroy_channel("dampen")
 
     async def test_multiple_participants_share_turns(self):
         emitter = CollectingEmitter()
@@ -536,8 +572,9 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
         await b.deregister(arbiter, "bundle")
         await arbiter.destroy_channel("bundle")
 
-    async def test_winner_gets_null_bid_request_when_cooldown_nonzero(self):
-        """With cooldown_ticks>=1 the winner's BusEvent has bid_request=null."""
+    async def test_winner_gets_bid_request_even_when_cooldown_nonzero(self):
+        """The winner stays eligible under cooldown (dampened, not locked out),
+        so its BusEvent carries a bundled bid_request (§4.6)."""
         winner_bid_requests: list = []
 
         class WinnerCapture(_AlwaysBid):
@@ -561,7 +598,9 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(len(winner_bid_requests), 0, "winner should have transmitted")
         for br in winner_bid_requests:
-            self.assertIsNone(br, "winner gets bid_request=null when cooldown_ticks>=1")
+            self.assertIsNotNone(
+                br, "winner stays eligible and gets a bundled bid_request"
+            )
 
         await p.deregister(arbiter, "wbr")
         await arbiter.destroy_channel("wbr")

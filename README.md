@@ -8,14 +8,14 @@ Each channel runs a continuous tick loop with six phases:
 
 | Phase | Action |
 |-------|--------|
-| 1 | Decrement post-win cooldown counters |
+| 1 | Decrement ineligibility counters |
 | 2 | Collect bids from eligible participants |
-| 3 | Weight bids (apply direct-address bias) |
+| 3 | Weight bids (cooldown dampening ×0.3; direct-address bias ×2.0) |
 | 4 | Select winner (highest weighted priority; random tiebreak) |
 | 5 | Signal winner, receive transmission |
 | 6 | Broadcast event to all participants; piggyback next bid request |
 
-Participants that win a tick are held ineligible for `cooldown_ticks` ticks. Participants that fail repeatedly are temporarily suspended.
+Participants that win a tick stay eligible, but their bids are dampened (×0.3) for the next `cooldown_ticks` ticks — the cooldown window is derived from `last_acted_tick`, not a stored counter. Participants that fail repeatedly are temporarily suspended via `ineligible_ticks`.
 
 ## Install
 
@@ -66,7 +66,7 @@ See [`examples/simple_example.py`](examples/simple_example.py) for a three-agent
 
 ```python
 Arbiter(
-    cooldown_ticks=1,           # ticks a winner sits out after transmitting
+    cooldown_ticks=2,           # ticks a winner's bids are dampened ×0.3 after transmitting
     bid_timeout=5.0,            # seconds to wait for a bid before substituting default
     transmission_timeout=60.0,  # seconds to wait for a transmission
     max_consecutive_failures=2, # failures before temporary suspension
@@ -110,7 +110,7 @@ Bid(
 )
 ```
 
-A participant directly addressed by the previous transmission receives a priority floor of `0.95` regardless of its submitted priority.
+A participant directly addressed by the previous transmission has its bid priority multiplied ×2.0 (clamped to 1.0); its own priority signal is preserved. A participant inside its cooldown window (`channel.tick - last_acted_tick <= cooldown_ticks`) has its bid priority multiplied ×0.3.
 
 ### `TransmissionResponse`
 
@@ -154,7 +154,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-41 tests cover the full tick lifecycle, bid weighting, membership queue, cooldown, failure streaks, observability, and error cases.
+45 tests cover the full tick lifecycle, bid weighting (cooldown dampening and direct-address bias), membership queue, failure streaks, observability, and error cases.
 
 ## License
 

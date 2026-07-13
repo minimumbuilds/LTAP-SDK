@@ -44,14 +44,15 @@ BID_SCHEMA: Dict[str, Any] = {
 class Participant:
     """Per-channel arbitration state for one participant (§3.1).
 
-    cooldown was removed in spec v1.0; post-transmission backoff is now
-    implemented via ineligible_ticks set in Phase 6.
+    There is no stored cooldown counter: the cooldown window is derived
+    from last_acted_tick at weighting time (§4.3).  ineligible_ticks is
+    the failure-streak penalty only (§4.5); winners stay eligible.
     """
 
     id: ParticipantId
     ineligible_ticks: int = 0
     failure_streak: int = 0
-    last_acted_tick: int = 0
+    last_acted_tick: Optional[int] = None  # None until first transmission
 
 
 @dataclass
