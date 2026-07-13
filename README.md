@@ -66,7 +66,11 @@ See [`examples/simple_example.py`](examples/simple_example.py) for a three-agent
 
 ```python
 Arbiter(
-    cooldown_ticks=2,           # ticks a winner's bids are dampened ×0.3 after transmitting
+    cooldown_ticks=2,           # ticks a winner's bids are dampened after transmitting
+    dampening_factor=0.3,       # cooldown multiplier; 1.0 disables, 0.0 = hard mute for the window
+    address_bias=2.0,           # direct-address multiplier; 1.0 disables
+    eligibility_threshold=0.1,  # weighted priority must exceed this to contend
+    tie_band=0.05,              # winner drawn uniformly from bids within tie_band of the top
     bid_timeout=5.0,            # seconds to wait for a bid before substituting default
     transmission_timeout=60.0,  # seconds to wait for a transmission
     max_consecutive_failures=2, # failures before temporary suspension
@@ -75,6 +79,8 @@ Arbiter(
     tick_interval=0.0,          # seconds between ticks (0 = yield only)
 )
 ```
+
+Defaults are the spec §3.8 reference values. `dampening_factor=0.0` reproduces the pre-v1.0 hard-lockout behaviour as a configuration rather than a fork.
 
 | Method | Description |
 |--------|-------------|
@@ -154,7 +160,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-45 tests cover the full tick lifecycle, bid weighting (cooldown dampening and direct-address bias), membership queue, failure streaks, observability, and error cases.
+55 tests cover the full tick lifecycle, bid weighting (cooldown dampening, direct-address bias, custom weighting parameters), membership queue, failure streaks, observability, and error cases.
 
 ## License
 
