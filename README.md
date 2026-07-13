@@ -160,7 +160,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-55 tests cover the full tick lifecycle, bid weighting (cooldown dampening, direct-address bias, custom weighting parameters), membership queue, failure streaks, observability, and error cases.
+63 tests cover the full tick lifecycle, bid weighting (cooldown dampening, direct-address bias, custom weighting parameters), membership queue, failure streaks, observability, error cases, and multi-tick arbitration scenarios (tests/test_scenarios.py: anti-monopoly, anti-lockout, address-bias, fairness, and split-ownership regression properties).
 
 ## License
 
