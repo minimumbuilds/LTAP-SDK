@@ -204,8 +204,14 @@ class TestBidWeighting(unittest.IsolatedAsyncioTestCase):
         tick: int = 1,
         cooldown_ticks: int = 2,
         addressed_to: str | None = None,
+        dampening_factor: float = 0.3,
+        address_bias: float = 2.0,
     ) -> float:
-        arbiter = Arbiter(cooldown_ticks=cooldown_ticks)
+        arbiter = Arbiter(
+            cooldown_ticks=cooldown_ticks,
+            dampening_factor=dampening_factor,
+            address_bias=address_bias,
+        )
         participant = Participant(id="x", last_acted_tick=last_acted_tick)
         channel = Channel(id="c")
         channel.tick = tick
@@ -276,6 +282,64 @@ class TestBidWeighting(unittest.IsolatedAsyncioTestCase):
             0.3,
             places=5,
         )
+
+    def test_custom_dampening_factor(self):
+        self.assertAlmostEqual(
+            self._weigh(1.0, last_acted_tick=5, tick=6, dampening_factor=0.5),
+            0.5,
+            places=5,
+        )
+
+    def test_dampening_factor_one_disables_dampening(self):
+        self.assertAlmostEqual(
+            self._weigh(0.8, last_acted_tick=5, tick=6, dampening_factor=1.0),
+            0.8,
+            places=5,
+        )
+
+    def test_dampening_factor_zero_is_hard_mute(self):
+        # ×0.0 zeroes the weighted priority, which fails the eligibility
+        # threshold — the pre-v1.0 lockout model as a configuration.
+        self.assertAlmostEqual(
+            self._weigh(1.0, last_acted_tick=5, tick=6, dampening_factor=0.0),
+            0.0,
+            places=5,
+        )
+
+    def test_custom_address_bias(self):
+        self.assertAlmostEqual(
+            self._weigh(0.2, addressed_to="x", address_bias=3.0), 0.6, places=5
+        )
+
+    def test_address_bias_one_disables_bias(self):
+        self.assertAlmostEqual(
+            self._weigh(0.4, addressed_to="x", address_bias=1.0), 0.4, places=5
+        )
+
+
+class TestWeightingParameterValidation(unittest.TestCase):
+
+    def test_dampening_factor_out_of_range_rejected(self):
+        with self.assertRaises(ValueError):
+            Arbiter(dampening_factor=1.5)
+        with self.assertRaises(ValueError):
+            Arbiter(dampening_factor=-0.1)
+
+    def test_address_bias_negative_rejected(self):
+        with self.assertRaises(ValueError):
+            Arbiter(address_bias=-1.0)
+
+    def test_eligibility_threshold_out_of_range_rejected(self):
+        with self.assertRaises(ValueError):
+            Arbiter(eligibility_threshold=1.0)
+        with self.assertRaises(ValueError):
+            Arbiter(eligibility_threshold=-0.01)
+
+    def test_tie_band_out_of_range_rejected(self):
+        with self.assertRaises(ValueError):
+            Arbiter(tie_band=1.01)
+        with self.assertRaises(ValueError):
+            Arbiter(tie_band=-0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +474,39 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
 
         await p.deregister(arbiter, "silent")
         await arbiter.destroy_channel("silent")
+
+    async def test_custom_eligibility_threshold_excludes_low_bids(self):
+        """A raised eligibility_threshold keeps low-priority bidders out of
+        contention entirely (§4.4)."""
+        emitter = CollectingEmitter()
+        arbiter = Arbiter(
+            cooldown_ticks=1,
+            eligibility_threshold=0.5,
+            bid_timeout=0.2,
+            transmission_timeout=1.0,
+            observability_emitter=emitter,
+            tick_interval=0.01,
+        )
+        arbiter.create_channel("thresh")
+        low = _AlwaysBid("low", priority=0.4)
+        high = _AlwaysBid("high", priority=0.7)
+        await low.register(arbiter, "thresh")
+        await high.register(arbiter, "thresh")
+
+        await asyncio.sleep(0.2)
+
+        low_wins = [r for r in emitter.records if r.participant == "low" and r.won]
+        high_wins = [r for r in emitter.records if r.participant == "high" and r.won]
+        self.assertEqual(len(low_wins), 0, "0.4 bid must not clear a 0.5 threshold")
+        self.assertGreater(len(high_wins), 0, "0.7 bid clears the threshold")
+        for r in emitter.records:
+            self.assertNotIn(
+                "low", r.contenders, "sub-threshold bids never enter the tie band"
+            )
+
+        await low.deregister(arbiter, "thresh")
+        await high.deregister(arbiter, "thresh")
+        await arbiter.destroy_channel("thresh")
 
     async def test_winner_dampened_but_eligible_after_win(self):
         """Phase 6 sets last_acted_tick; the winner stays eligible and its

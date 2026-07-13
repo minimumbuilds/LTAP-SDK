@@ -102,6 +102,10 @@ class Arbiter:
         self,
         *,
         cooldown_ticks: int = 2,
+        dampening_factor: float = 0.3,
+        address_bias: float = 2.0,
+        eligibility_threshold: float = 0.1,
+        tie_band: float = 0.05,
         bid_timeout: float = 5.0,
         transmission_timeout: float = 60.0,
         max_consecutive_failures: int = 2,
@@ -111,11 +115,29 @@ class Arbiter:
     ) -> None:
         if cooldown_ticks < 0:
             raise ValueError("cooldown_ticks must be >= 0")
+        if not 0.0 <= dampening_factor <= 1.0:
+            raise ValueError("dampening_factor must be in [0.0, 1.0]")
+        if address_bias < 0.0:
+            raise ValueError("address_bias must be >= 0.0")
+        if not 0.0 <= eligibility_threshold < 1.0:
+            raise ValueError("eligibility_threshold must be in [0.0, 1.0)")
+        if not 0.0 <= tie_band <= 1.0:
+            raise ValueError("tie_band must be in [0.0, 1.0]")
         if max_consecutive_failures < 0:
             raise ValueError("max_consecutive_failures must be >= 0")
 
         self._bus = Bus()
         self.COOLDOWN_TICKS = cooldown_ticks
+        # Weighting/selection parameters (§4.3, §4.4).  Reference values are
+        # the defaults.  dampening_factor=1.0 disables cooldown dampening;
+        # dampening_factor=0.0 makes the cooldown window a hard mute (weighted
+        # priority 0 fails the eligibility threshold) — the old lockout model
+        # as a configuration.  address_bias=1.0 disables the address bias.
+        # tie_band=0.0 means ties only on exact equality.
+        self.DAMPENING_FACTOR = dampening_factor
+        self.ADDRESS_BIAS = address_bias
+        self.ELIGIBILITY_THRESHOLD = eligibility_threshold
+        self.TIE_BAND = tie_band
         self.BID_TIMEOUT = bid_timeout
         self.TRANSMISSION_TIMEOUT = transmission_timeout
         self.MAX_CONSECUTIVE_FAILURES = max_consecutive_failures
@@ -357,8 +379,8 @@ class Arbiter:
 
         # ----------------------------------------------------------------
         # Phase 3 — Weight bids (§4.3)
-        # Pipeline: cooldown dampening (×0.3, derived from last_acted_tick),
-        # direct-address bias (×2.0), clamp.
+        # Pipeline: cooldown dampening (×DAMPENING_FACTOR, derived from
+        # last_acted_tick), direct-address bias (×ADDRESS_BIAS), clamp.
         # ----------------------------------------------------------------
         most_recent_tx = self._most_recent_transmission(channel)
         weighted_bids: List[_WeightedBid] = []
@@ -383,7 +405,8 @@ class Arbiter:
         eligible_weighted = [
             wb
             for wb in weighted_bids
-            if wb.raw_bid.want_to_send and wb.weighted_priority > 0.1
+            if wb.raw_bid.want_to_send
+            and wb.weighted_priority > self.ELIGIBILITY_THRESHOLD
         ]
 
         winner_id: Optional[ParticipantId] = None
@@ -393,7 +416,9 @@ class Arbiter:
         if eligible_weighted:
             top = max(wb.weighted_priority for wb in eligible_weighted)
             contender_bids = [
-                wb for wb in eligible_weighted if wb.weighted_priority >= top - 0.05
+                wb
+                for wb in eligible_weighted
+                if wb.weighted_priority >= top - self.TIE_BAND
             ]
             contenders = [wb.participant_id for wb in contender_bids]
             rng_state = random.getstate()
@@ -598,7 +623,7 @@ class Arbiter:
             participant.last_acted_tick is not None
             and channel.tick - participant.last_acted_tick <= self.COOLDOWN_TICKS
         ):
-            p *= 0.3
+            p *= self.DAMPENING_FACTOR
 
         # Step 2: direct-address bias.  Multiplicative so the addressee's own
         # priority signal is preserved; the earlier max(p, 0.95) floor caused
@@ -607,7 +632,7 @@ class Arbiter:
             most_recent_tx is not None
             and most_recent_tx.addressed_to == participant.id
         ):
-            p *= 2.0
+            p *= self.ADDRESS_BIAS
 
         # Step 3: clamp
         return max(0.0, min(1.0, p))
