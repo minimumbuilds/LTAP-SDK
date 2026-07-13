@@ -8,7 +8,7 @@ Python SDK and reference Arbiter for the LLM Shared-Bus Turn Allocation Protocol
 
 ```bash
 pip install -e ".[dev]"
-pytest                    # 55 tests, all async
+pytest                    # 63 tests, all async
 ```
 
 No runtime deps — stdlib only. Tests use `pytest-asyncio` with `asyncio_mode = "auto"`.
@@ -27,6 +27,7 @@ examples/
   simple_example.py
 tests/
   test_arbiter.py
+  test_scenarios.py — multi-tick scenario suite (scripted agents, emergent properties)
 ```
 
 ## Key architecture decisions
